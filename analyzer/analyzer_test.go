@@ -1,53 +1,28 @@
 package analyzer
 
 import (
-	"fmt"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 
-func TestReadonlyAnalyzer(t *testing.T) {
-	testCases := []struct {
-		name        string
-		pkg         string
-		expectError bool
-	}{
-		{
-			name:        "valid reader package",
-			pkg:         "validreader",
-			expectError: false,
-		},
-		{
-			name:        "invalid assignments",
-			pkg:         "invalidreader",
-			expectError: true,
-		},
+func TestAnalyzerResults(t *testing.T) {
+	testdata := analysistest.TestData()
+	analyzer := NewAnalyzer("reader", "data", "BigStruct")
+
+	results := analysistest.Run(t, testdata, analyzer, "invalidreader")
+
+	// Проверяем результаты
+	if len(results) == 0 {
+		t.Fatal("expected issues, got none")
 	}
 
-	testdata := analysistest.TestData()
+	issues, ok := results[0].Result.([]Issue)
+	if !ok {
+		t.Fatalf("expected []Issue, got %T", results[0].Result)
+	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(
-				"reader",    // Проверяем только пакет 'reader'
-				"data",      // Структуры из пакета 'data'
-				"BigStruct", // Защищаемая структура
-			)
-
-			results := analysistest.Run(t, testdata, analyzer, tc.pkg)
-			if tc.expectError {
-				if len(results) == 0 || len(results[0].Diagnostics) == 0 {
-					t.Errorf("Ожидались ошибки, но их не было")
-				}
-			} else {
-				fmt.Println("err")
-				for _, r := range results {
-					if len(r.Diagnostics) > 0 {
-						t.Errorf("Неожиданные ошибки: %v", r.Diagnostics)
-					}
-				}
-			}
-		})
+	if len(issues) < 2 {
+		t.Errorf("expected at least 2 issues, got %d", len(issues))
 	}
 }

@@ -5,16 +5,23 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"reflect"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 )
 
+type Issue struct {
+	Pos     token.Pos
+	Message string
+}
+
 type readonlyAnalyzer struct {
 	readerPkg    string
 	dataPkg      string
 	targetStruct string
+	issues       []Issue
 }
 
 func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
@@ -25,11 +32,12 @@ func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
 	}
 
 	return &analysis.Analyzer{
-		Name:     "readonly",
-		Doc:      "Checks that Reader package doesn't modify target structure (including pointer receivers)",
-		Run:      a.run,
-		Requires: []*analysis.Analyzer{inspect.Analyzer},
-		Flags:    a.newFlagSet(),
+		Name:       "readonly",
+		Doc:        "Checks that Reader package doesn't modify target structure (including pointer receivers)",
+		Run:        a.run,
+		Requires:   []*analysis.Analyzer{inspect.Analyzer},
+		Flags:      a.newFlagSet(),
+		ResultType: reflect.TypeOf([]Issue{}),
 	}
 }
 
@@ -43,8 +51,10 @@ func (a *readonlyAnalyzer) newFlagSet() flag.FlagSet {
 
 func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	if pass.Pkg.Name() != a.readerPkg {
-		return nil, nil
+		return []Issue{}, nil
 	}
+
+	a.issues = make([]Issue, 0)
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -52,7 +62,9 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.AssignStmt)(nil),
 		(*ast.IncDecStmt)(nil),
 		(*ast.CallExpr)(nil),
-		(*ast.UnaryExpr)(nil), // Для проверки разыменований
+		(*ast.UnaryExpr)(nil),
+		(*ast.RangeStmt)(nil),
+		(*ast.FuncDecl)(nil),
 	}
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
@@ -67,14 +79,21 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 			if node.Op == token.AND {
 				a.checkAddressOf(pass, node)
 			}
+		case *ast.RangeStmt:
+			a.checkRange(pass, node)
+		case *ast.FuncDecl:
+			a.checkReceiver(pass, node)
 		}
 	})
 
-	return nil, nil
+	for _, issue := range a.issues {
+		pass.Reportf(issue.Pos, issue.Message)
+	}
+
+	return a.issues, nil
 }
 
 func (a *readonlyAnalyzer) isTargetType(t types.Type) bool {
-	// Проверяем как сам тип, так и указатели на него
 	switch typ := t.(type) {
 	case *types.Pointer:
 		return a.isTargetType(typ.Elem())
@@ -83,42 +102,79 @@ func (a *readonlyAnalyzer) isTargetType(t types.Type) bool {
 			typ.Obj().Pkg() != nil &&
 			typ.Obj().Pkg().Name() == a.dataPkg &&
 			typ.Obj().Name() == a.targetStruct
+	case *types.Struct:
+		for i := 0; i < typ.NumFields(); i++ {
+			if a.isTargetType(typ.Field(i).Type()) {
+				return true
+			}
+		}
 	}
 	return false
 }
 
+func (a *readonlyAnalyzer) addIssue(pos token.Pos, message string) {
+	a.issues = append(a.issues, Issue{Pos: pos, Message: message})
+}
+
 func (a *readonlyAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.AssignStmt) {
 	for _, lhs := range assign.Lhs {
-		// Проверяем присваивание полям структуры
 		if sel, ok := lhs.(*ast.SelectorExpr); ok {
 			if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
-				pass.Reportf(lhs.Pos(), "assignment to field of BigStruct is forbidden")
+				a.addIssue(lhs.Pos(), "assignment to field of "+a.targetStruct+" is forbidden")
 			}
 		}
-
-		// Проверяем присваивание самой структуре
 		if t := pass.TypesInfo.TypeOf(lhs); t != nil && a.isTargetType(t) {
-			pass.Reportf(lhs.Pos(), "assignment to BigStruct is forbidden")
+			a.addIssue(lhs.Pos(), "assignment to "+a.targetStruct+" is forbidden")
 		}
 	}
 }
 
 func (a *readonlyAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecStmt) {
+	if sel, ok := incDec.X.(*ast.SelectorExpr); ok {
+		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+			a.addIssue(incDec.Pos(), "modification of "+a.targetStruct+" is forbidden")
+		}
+	}
 	if t := pass.TypesInfo.TypeOf(incDec.X); t != nil && a.isTargetType(t) {
-		pass.Reportf(incDec.Pos(), "modification of %s is forbidden", a.targetStruct)
+		a.addIssue(incDec.Pos(), "modification of "+a.targetStruct+" is forbidden")
 	}
 }
 
 func (a *readonlyAnalyzer) checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
-			pass.Reportf(call.Pos(), "method call on %s is forbidden", a.targetStruct)
+			a.addIssue(call.Pos(), "method call on "+a.targetStruct+" is forbidden")
 		}
 	}
 }
 
 func (a *readonlyAnalyzer) checkAddressOf(pass *analysis.Pass, unary *ast.UnaryExpr) {
 	if t := pass.TypesInfo.TypeOf(unary.X); t != nil && a.isTargetType(t) {
-		pass.Reportf(unary.Pos(), "taking address of %s may lead to modifications", a.targetStruct)
+		a.addIssue(unary.Pos(), "taking address of "+a.targetStruct+" may lead to modifications")
+	}
+}
+
+func (a *readonlyAnalyzer) checkRange(pass *analysis.Pass, rng *ast.RangeStmt) {
+	if rng.Key != nil {
+		if t := pass.TypesInfo.TypeOf(rng.Key); t != nil && a.isTargetType(t) {
+			a.addIssue(rng.Key.Pos(), "range key variable of type "+a.targetStruct+" is forbidden")
+		}
+	}
+	if rng.Value != nil {
+		if t := pass.TypesInfo.TypeOf(rng.Value); t != nil && a.isTargetType(t) {
+			a.addIssue(rng.Value.Pos(), "range value variable of type "+a.targetStruct+" is forbidden")
+		}
+	}
+}
+
+func (a *readonlyAnalyzer) checkReceiver(pass *analysis.Pass, fn *ast.FuncDecl) {
+	if fn.Recv != nil {
+		for _, field := range fn.Recv.List {
+			for _, name := range field.Names {
+				if t := pass.TypesInfo.TypeOf(name); t != nil && a.isTargetType(t) {
+					a.addIssue(fn.Pos(), "method with "+a.targetStruct+" receiver is forbidden")
+				}
+			}
+		}
 	}
 }

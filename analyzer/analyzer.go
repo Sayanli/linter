@@ -32,8 +32,8 @@ func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
 	}
 
 	return &analysis.Analyzer{
-		Name:       "readonly",
-		Doc:        "Checks that Reader package doesn't modify target structure (including pointer receivers)",
+		Name:       "todo",
+		Doc:        "todo",
 		Run:        a.run,
 		Requires:   []*analysis.Analyzer{inspect.Analyzer},
 		Flags:      a.newFlagSet(),
@@ -59,12 +59,14 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
-		(*ast.AssignStmt)(nil),
-		(*ast.IncDecStmt)(nil),
+		(*ast.AssignStmt)(nil), // =, +=, -=, ...
+		(*ast.IncDecStmt)(nil), // ++, --
 		(*ast.CallExpr)(nil),
-		(*ast.UnaryExpr)(nil),
-		(*ast.RangeStmt)(nil),
+		(*ast.UnaryExpr)(nil), // &
+		(*ast.RangeStmt)(nil), // range
 		(*ast.FuncDecl)(nil),
+		//TODO добавить проверку указателей
+		//(*ast.Ident)(nil),
 	}
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
@@ -83,6 +85,8 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 			a.checkRange(pass, node)
 		case *ast.FuncDecl:
 			a.checkReceiver(pass, node)
+			//case *ast.Ident:
+			//	a.checkIdent(pass, node)
 		}
 	})
 
@@ -132,11 +136,11 @@ func (a *readonlyAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.Assi
 func (a *readonlyAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecStmt) {
 	if sel, ok := incDec.X.(*ast.SelectorExpr); ok {
 		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
-			a.addIssue(incDec.Pos(), "modification of "+a.targetStruct+" is forbidden")
+			a.addIssue(incDec.Pos(), "IncDec modification of "+a.targetStruct+" is forbidden")
 		}
 	}
 	if t := pass.TypesInfo.TypeOf(incDec.X); t != nil && a.isTargetType(t) {
-		a.addIssue(incDec.Pos(), "modification of "+a.targetStruct+" is forbidden")
+		a.addIssue(incDec.Pos(), "IncDec modification of "+a.targetStruct+" is forbidden")
 	}
 }
 

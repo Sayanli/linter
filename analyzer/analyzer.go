@@ -17,11 +17,18 @@ type Issue struct {
 	Message string
 }
 
+type Alias struct {
+	Name string
+	Expr *ast.SelectorExpr
+	Prev *Alias
+}
+
 type readonlyAnalyzer struct {
 	readerPkg    string
 	dataPkg      string
 	targetStruct string
 	issues       []Issue
+	aliases      map[string]*Alias
 }
 
 func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
@@ -29,6 +36,7 @@ func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
 		readerPkg:    readerPkg,
 		dataPkg:      dataPkg,
 		targetStruct: targetStruct,
+		aliases:      make(map[string]*Alias),
 	}
 
 	return &analysis.Analyzer{
@@ -43,7 +51,7 @@ func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
 
 func (a *readonlyAnalyzer) newFlagSet() flag.FlagSet {
 	fs := flag.NewFlagSet("readonly", flag.ExitOnError)
-	fs.StringVar(&a.readerPkg, "reader", a.readerPkg, "package name to check")
+	fs.StringVar(&a.readerPkg, "reader", a.readerPkg, "package name to check read only")
 	fs.StringVar(&a.dataPkg, "data", a.dataPkg, "data package name")
 	fs.StringVar(&a.targetStruct, "struct", a.targetStruct, "protected structure name")
 	return *fs
@@ -55,18 +63,16 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	}
 
 	a.issues = make([]Issue, 0)
+	a.aliases = make(map[string]*Alias)
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
-		(*ast.AssignStmt)(nil), // =, +=, -=, ...
-		(*ast.IncDecStmt)(nil), // ++, --
+		(*ast.AssignStmt)(nil),
+		(*ast.IncDecStmt)(nil),
 		(*ast.CallExpr)(nil),
-		(*ast.UnaryExpr)(nil), // &
-		(*ast.RangeStmt)(nil), // range
-		(*ast.FuncDecl)(nil),
-		//TODO добавить проверку указателей
-		//(*ast.Ident)(nil),
+		(*ast.UnaryExpr)(nil),
+		(*ast.RangeStmt)(nil),
 	}
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
@@ -77,16 +83,8 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 			a.checkIncDec(pass, node)
 		case *ast.CallExpr:
 			a.checkCall(pass, node)
-		case *ast.UnaryExpr:
-			if node.Op == token.AND {
-				a.checkAddressOf(pass, node)
-			}
 		case *ast.RangeStmt:
 			a.checkRange(pass, node)
-		case *ast.FuncDecl:
-			a.checkReceiver(pass, node)
-			//case *ast.Ident:
-			//	a.checkIdent(pass, node)
 		}
 	})
 
@@ -95,6 +93,23 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	}
 
 	return a.issues, nil
+}
+
+func (a *readonlyAnalyzer) resolveAlias(name string) *ast.SelectorExpr {
+	seen := make(map[string]bool)
+	curr := a.aliases[name]
+
+	for curr != nil {
+		if seen[curr.Name] {
+			break
+		}
+		seen[curr.Name] = true
+		if curr.Expr != nil {
+			return curr.Expr
+		}
+		curr = curr.Prev
+	}
+	return nil
 }
 
 func (a *readonlyAnalyzer) isTargetType(t types.Type) bool {
@@ -121,26 +136,56 @@ func (a *readonlyAnalyzer) addIssue(pos token.Pos, message string) {
 }
 
 func (a *readonlyAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.AssignStmt) {
-	for _, lhs := range assign.Lhs {
-		if sel, ok := lhs.(*ast.SelectorExpr); ok {
-			if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
-				a.addIssue(lhs.Pos(), "assignment to field of "+a.targetStruct+" is forbidden")
+	for i, lhs := range assign.Lhs {
+		switch expr := lhs.(type) {
+		case *ast.SelectorExpr:
+			if t := pass.TypesInfo.TypeOf(expr.X); t != nil && a.isTargetType(t) {
+				a.addIssue(expr.Pos(), "direct assignment to field of "+a.targetStruct+" is forbidden")
+			}
+		case *ast.StarExpr:
+			if ident, ok := expr.X.(*ast.Ident); ok {
+				if sel := a.resolveAlias(ident.Name); sel != nil {
+					if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+						a.addIssue(expr.Pos(), "modification through pointer to "+a.targetStruct+" field is forbidden")
+					}
+				}
 			}
 		}
-		if t := pass.TypesInfo.TypeOf(lhs); t != nil && a.isTargetType(t) {
-			a.addIssue(lhs.Pos(), "assignment to "+a.targetStruct+" is forbidden")
+
+		// отслеживание алиасов
+		if ident, ok := lhs.(*ast.Ident); ok && i < len(assign.Rhs) {
+			switch rhs := assign.Rhs[i].(type) {
+			case *ast.UnaryExpr:
+				if rhs.Op == token.AND {
+					if sel, ok := rhs.X.(*ast.SelectorExpr); ok {
+						if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+							a.aliases[ident.Name] = &Alias{Name: ident.Name, Expr: sel, Prev: nil}
+						}
+					}
+				}
+			case *ast.Ident:
+				if prev, found := a.aliases[rhs.Name]; found {
+					a.aliases[ident.Name] = &Alias{Name: ident.Name, Prev: prev}
+				}
+			}
 		}
 	}
 }
 
 func (a *readonlyAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecStmt) {
-	if sel, ok := incDec.X.(*ast.SelectorExpr); ok {
-		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
-			a.addIssue(incDec.Pos(), "IncDec modification of "+a.targetStruct+" is forbidden")
+	switch expr := incDec.X.(type) {
+	case *ast.SelectorExpr:
+		if t := pass.TypesInfo.TypeOf(expr.X); t != nil && a.isTargetType(t) {
+			a.addIssue(incDec.Pos(), "increment/decrement of "+a.targetStruct+" field is forbidden")
 		}
-	}
-	if t := pass.TypesInfo.TypeOf(incDec.X); t != nil && a.isTargetType(t) {
-		a.addIssue(incDec.Pos(), "IncDec modification of "+a.targetStruct+" is forbidden")
+	case *ast.StarExpr:
+		if ident, ok := expr.X.(*ast.Ident); ok {
+			if sel := a.resolveAlias(ident.Name); sel != nil {
+				if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+					a.addIssue(incDec.Pos(), "increment/decrement through pointer to "+a.targetStruct+" field is forbidden")
+				}
+			}
+		}
 	}
 }
 
@@ -149,12 +194,6 @@ func (a *readonlyAnalyzer) checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
 			a.addIssue(call.Pos(), "method call on "+a.targetStruct+" is forbidden")
 		}
-	}
-}
-
-func (a *readonlyAnalyzer) checkAddressOf(pass *analysis.Pass, unary *ast.UnaryExpr) {
-	if t := pass.TypesInfo.TypeOf(unary.X); t != nil && a.isTargetType(t) {
-		a.addIssue(unary.Pos(), "taking address of "+a.targetStruct+" may lead to modifications")
 	}
 }
 
@@ -167,18 +206,6 @@ func (a *readonlyAnalyzer) checkRange(pass *analysis.Pass, rng *ast.RangeStmt) {
 	if rng.Value != nil {
 		if t := pass.TypesInfo.TypeOf(rng.Value); t != nil && a.isTargetType(t) {
 			a.addIssue(rng.Value.Pos(), "range value variable of type "+a.targetStruct+" is forbidden")
-		}
-	}
-}
-
-func (a *readonlyAnalyzer) checkReceiver(pass *analysis.Pass, fn *ast.FuncDecl) {
-	if fn.Recv != nil {
-		for _, field := range fn.Recv.List {
-			for _, name := range field.Names {
-				if t := pass.TypesInfo.TypeOf(name); t != nil && a.isTargetType(t) {
-					a.addIssue(fn.Pos(), "method with "+a.targetStruct+" receiver is forbidden")
-				}
-			}
 		}
 	}
 }

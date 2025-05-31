@@ -8,7 +8,7 @@ import (
 
 func TestAnalyzerResults(t *testing.T) {
 	testdata := analysistest.TestData()
-	analyzer := NewAnalyzer("reader", "data", "BigStruct")
+	analyzer := NewAnalyzer("reader", "data", "BigStruct", "writer")
 
 	results := analysistest.Run(t, testdata, analyzer, "invalidreader")
 

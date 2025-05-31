@@ -23,17 +23,19 @@ type Alias struct {
 	Prev *Alias
 }
 
-type readonlyAnalyzer struct {
+type RWsepAnalyzer struct {
 	readerPkg    string
+	writerPkg    string
 	dataPkg      string
 	targetStruct string
 	issues       []Issue
 	aliases      map[string]*Alias
 }
 
-func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
-	a := &readonlyAnalyzer{
+func NewAnalyzer(readerPkg, dataPkg, targetStruct, writerPkg string) *analysis.Analyzer {
+	a := &RWsepAnalyzer{
 		readerPkg:    readerPkg,
+		writerPkg:    writerPkg,
 		dataPkg:      dataPkg,
 		targetStruct: targetStruct,
 		aliases:      make(map[string]*Alias),
@@ -49,15 +51,16 @@ func NewAnalyzer(readerPkg, dataPkg, targetStruct string) *analysis.Analyzer {
 	}
 }
 
-func (a *readonlyAnalyzer) newFlagSet() flag.FlagSet {
+func (a *RWsepAnalyzer) newFlagSet() flag.FlagSet {
 	fs := flag.NewFlagSet("readonly", flag.ExitOnError)
 	fs.StringVar(&a.readerPkg, "reader", a.readerPkg, "package name to check read only")
+	fs.StringVar(&a.writerPkg, "writer", a.writerPkg, "package name to check write only")
 	fs.StringVar(&a.dataPkg, "data", a.dataPkg, "data package name")
 	fs.StringVar(&a.targetStruct, "struct", a.targetStruct, "protected structure name")
 	return *fs
 }
 
-func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
+func (a *RWsepAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	if pass.Pkg.Name() != a.readerPkg {
 		return []Issue{}, nil
 	}
@@ -95,7 +98,7 @@ func (a *readonlyAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	return a.issues, nil
 }
 
-func (a *readonlyAnalyzer) resolveAlias(name string) *ast.SelectorExpr {
+func (a *RWsepAnalyzer) resolveAlias(name string) *ast.SelectorExpr {
 	seen := make(map[string]bool)
 	curr := a.aliases[name]
 
@@ -112,7 +115,7 @@ func (a *readonlyAnalyzer) resolveAlias(name string) *ast.SelectorExpr {
 	return nil
 }
 
-func (a *readonlyAnalyzer) isTargetType(t types.Type) bool {
+func (a *RWsepAnalyzer) isTargetType(t types.Type) bool {
 	switch typ := t.(type) {
 	case *types.Pointer:
 		return a.isTargetType(typ.Elem())
@@ -131,11 +134,11 @@ func (a *readonlyAnalyzer) isTargetType(t types.Type) bool {
 	return false
 }
 
-func (a *readonlyAnalyzer) addIssue(pos token.Pos, message string) {
+func (a *RWsepAnalyzer) addIssue(pos token.Pos, message string) {
 	a.issues = append(a.issues, Issue{Pos: pos, Message: message})
 }
 
-func (a *readonlyAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.AssignStmt) {
+func (a *RWsepAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.AssignStmt) {
 	for i, lhs := range assign.Lhs {
 		switch expr := lhs.(type) {
 		case *ast.SelectorExpr:
@@ -172,7 +175,7 @@ func (a *readonlyAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.Assi
 	}
 }
 
-func (a *readonlyAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecStmt) {
+func (a *RWsepAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecStmt) {
 	switch expr := incDec.X.(type) {
 	case *ast.SelectorExpr:
 		if t := pass.TypesInfo.TypeOf(expr.X); t != nil && a.isTargetType(t) {
@@ -189,7 +192,7 @@ func (a *readonlyAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecSt
 	}
 }
 
-func (a *readonlyAnalyzer) checkCall(pass *analysis.Pass, call *ast.CallExpr) {
+func (a *RWsepAnalyzer) checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
 			a.addIssue(call.Pos(), "method call on "+a.targetStruct+" is forbidden")
@@ -197,7 +200,7 @@ func (a *readonlyAnalyzer) checkCall(pass *analysis.Pass, call *ast.CallExpr) {
 	}
 }
 
-func (a *readonlyAnalyzer) checkRange(pass *analysis.Pass, rng *ast.RangeStmt) {
+func (a *RWsepAnalyzer) checkRange(pass *analysis.Pass, rng *ast.RangeStmt) {
 	if rng.Key != nil {
 		if t := pass.TypesInfo.TypeOf(rng.Key); t != nil && a.isTargetType(t) {
 			a.addIssue(rng.Key.Pos(), "range key variable of type "+a.targetStruct+" is forbidden")

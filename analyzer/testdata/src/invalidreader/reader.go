@@ -28,12 +28,20 @@ func (r *Reader) ModifyThroughPointer() string {
 
 	p2 := &r.d.Value1
 	*p2 = 3 // want "modification through pointer to BigStruct field is forbidden"
-	modifyString(p)
 
 	return *p
 }
 
-func modifyString(s *string) {
-	//TODO добавить ошибки на изменения в функции
-	*s = "new string"
+func (r *Reader) ModifyByRange() string {
+	for i, _ := range r.d.Arr {
+		r.d.Arr[i] = 0 // want "modification to BigStruct field is forbidden"
+	}
+	return "modified"
+}
+
+func (r *Reader) ModifyMap() string {
+	for k, _ := range r.d.Map {
+		r.d.Map[k] = 0 // want "modification to BigStruct field is forbidden"
+	}
+	return "modified"
 }

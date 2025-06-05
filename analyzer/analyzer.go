@@ -73,9 +73,6 @@ func (a *RWsepAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 	nodeFilter := []ast.Node{
 		(*ast.AssignStmt)(nil),
 		(*ast.IncDecStmt)(nil),
-		(*ast.CallExpr)(nil),
-		(*ast.UnaryExpr)(nil),
-		(*ast.RangeStmt)(nil),
 	}
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
@@ -84,10 +81,6 @@ func (a *RWsepAnalyzer) run(pass *analysis.Pass) (interface{}, error) {
 			a.checkAssignment(pass, node)
 		case *ast.IncDecStmt:
 			a.checkIncDec(pass, node)
-		case *ast.CallExpr:
-			a.checkCall(pass, node)
-		case *ast.RangeStmt:
-			a.checkRange(pass, node)
 		}
 	})
 
@@ -153,6 +146,33 @@ func (a *RWsepAnalyzer) checkAssignment(pass *analysis.Pass, assign *ast.AssignS
 					}
 				}
 			}
+		case *ast.IndexExpr:
+			// r.d.Values[i] = ...
+			if sel, ok := expr.X.(*ast.SelectorExpr); ok {
+				if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+					a.addIssue(expr.Pos(), "modification to "+a.targetStruct+" field is forbidden")
+				}
+			}
+			// (*alias)[i] = ...
+			switch base := expr.X.(type) {
+			case *ast.Ident:
+				if sel := a.resolveAlias(base.Name); sel != nil {
+					if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+						a.addIssue(expr.Pos(), "modification through pointer to "+a.targetStruct+" field is forbidden")
+					}
+				}
+			// (*ptr)[i]
+			case *ast.ParenExpr:
+				if star, ok := base.X.(*ast.StarExpr); ok {
+					if ident, ok := star.X.(*ast.Ident); ok {
+						if sel := a.resolveAlias(ident.Name); sel != nil {
+							if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
+								a.addIssue(expr.Pos(), "modification through pointer to "+a.targetStruct+" field is forbidden")
+							}
+						}
+					}
+				}
+			}
 		}
 
 		// отслеживание алиасов
@@ -188,27 +208,6 @@ func (a *RWsepAnalyzer) checkIncDec(pass *analysis.Pass, incDec *ast.IncDecStmt)
 					a.addIssue(incDec.Pos(), "increment/decrement through pointer to "+a.targetStruct+" field is forbidden")
 				}
 			}
-		}
-	}
-}
-
-func (a *RWsepAnalyzer) checkCall(pass *analysis.Pass, call *ast.CallExpr) {
-	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-		if t := pass.TypesInfo.TypeOf(sel.X); t != nil && a.isTargetType(t) {
-			a.addIssue(call.Pos(), "method call on "+a.targetStruct+" is forbidden")
-		}
-	}
-}
-
-func (a *RWsepAnalyzer) checkRange(pass *analysis.Pass, rng *ast.RangeStmt) {
-	if rng.Key != nil {
-		if t := pass.TypesInfo.TypeOf(rng.Key); t != nil && a.isTargetType(t) {
-			a.addIssue(rng.Key.Pos(), "range key variable of type "+a.targetStruct+" is forbidden")
-		}
-	}
-	if rng.Value != nil {
-		if t := pass.TypesInfo.TypeOf(rng.Value); t != nil && a.isTargetType(t) {
-			a.addIssue(rng.Value.Pos(), "range value variable of type "+a.targetStruct+" is forbidden")
 		}
 	}
 }
